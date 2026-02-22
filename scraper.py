@@ -280,7 +280,8 @@ def extract_images(driver: webdriver.Chrome, url: str) -> list[dict]:
 
 # ── Image Download & Processing ──────────────────────────────────────────────
 
-def download_image(url: str, save_dir: str) -> str | None:
+def download_image(url: str, save_dir: str) -> tuple[str | None, str | None]:
+    """Download image. Returns (local_path, svg_source_code_or_None)."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15, stream=True)
         resp.raise_for_status()
@@ -310,15 +311,22 @@ def download_image(url: str, save_dir: str) -> str | None:
             for chunk in resp.iter_content(8192):
                 f.write(chunk)
 
+        svg_source = None
         if save_path.lower().endswith(".svg"):
+            # Read SVG source before conversion (for color analysis later)
+            try:
+                with open(save_path, "r", encoding="utf-8", errors="ignore") as sf:
+                    svg_source = sf.read()
+            except Exception:
+                pass
             save_path = convert_svg_to_png(save_path)
         if save_path and save_path.lower().endswith(".webp"):
             save_path = convert_webp_to_png(save_path)
 
-        return save_path
+        return save_path, svg_source
     except Exception as e:
-        print(f"[Download] Failed: {url[:80]} – {e}")
-        return None
+        print(f"[Download] Failed: {url[:80]} \u2013 {e}")
+        return None, None
 
 
 def save_inline_svg(svg_content: str, save_dir: str, index: int) -> str | None:
@@ -365,6 +373,86 @@ def convert_webp_to_png(webp_path: str) -> str | None:
         return webp_path
 
 
+# ── SVG Color Analysis ────────────────────────────────────────────────────────
+
+_CSS_COLORS = {
+    "black": (0,0,0), "white": (255,255,255), "red": (255,0,0),
+    "green": (0,128,0), "blue": (0,0,255), "yellow": (255,255,0),
+    "cyan": (0,255,255), "magenta": (255,0,255), "gray": (128,128,128),
+    "grey": (128,128,128), "silver": (192,192,192), "maroon": (128,0,0),
+    "olive": (128,128,0), "lime": (0,255,0), "aqua": (0,255,255),
+    "teal": (0,128,128), "navy": (0,0,128), "fuchsia": (255,0,255),
+    "purple": (128,0,128), "orange": (255,165,0), "pink": (255,192,203),
+    "brown": (165,42,42), "coral": (255,127,80), "crimson": (220,20,60),
+    "darkblue": (0,0,139), "darkgreen": (0,100,0), "darkred": (139,0,0),
+    "gold": (255,215,0), "indigo": (75,0,130), "ivory": (255,255,240),
+    "khaki": (240,230,140), "lavender": (230,230,250), "linen": (250,240,230),
+    "peru": (205,133,63), "plum": (221,160,221), "salmon": (250,128,114),
+    "sienna": (160,82,45), "skyblue": (135,206,235), "tan": (210,180,140),
+    "tomato": (255,99,71), "violet": (238,130,238), "wheat": (245,222,179),
+    "none": None, "transparent": None, "currentcolor": None,
+}
+
+
+def _parse_color(raw: str) -> tuple[int, int, int] | None:
+    """Convert a CSS color string to (R, G, B)."""
+    s = raw.strip().lower()
+    if not s:
+        return None
+    if s in _CSS_COLORS:
+        return _CSS_COLORS[s]
+    m = re.match(r"^#([0-9a-f]{3,8})$", s)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            return (int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16))
+        if len(h) >= 6:
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    m = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+def _extract_svg_colors(svg_code: str) -> list[tuple[int, int, int]]:
+    """Extract fill/stroke colors from SVG source."""
+    colors = []
+    for attr in re.finditer(r'(?:fill|stroke)\s*=\s*"([^"]+)"', svg_code):
+        c = _parse_color(attr.group(1))
+        if c:
+            colors.append(c)
+    for style in re.finditer(r'style\s*=\s*"([^"]+)"', svg_code):
+        for prop in re.finditer(r'(?:fill|stroke|color)\s*:\s*([^;]+)', style.group(1)):
+            c = _parse_color(prop.group(1))
+            if c:
+                colors.append(c)
+    for css in re.finditer(r'<style[^>]*>(.*?)</style>', svg_code, re.DOTALL):
+        for prop in re.finditer(r'(?:fill|stroke|color)\s*:\s*([^;}\s]+)', css.group(1)):
+            c = _parse_color(prop.group(1))
+            if c:
+                colors.append(c)
+    return colors
+
+
+def _luminance(r: int, g: int, b: int) -> float:
+    """Perceived luminance 0..1."""
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+
+
+def _svg_contrast_bg(svg_code: str) -> tuple[int, int, int]:
+    """Analyze SVG colors and return a contrasting background."""
+    colors = _extract_svg_colors(svg_code)
+    if not colors:
+        return (220, 220, 220)
+    avg_lum = sum(_luminance(*c) for c in colors) / len(colors)
+    if avg_lum > 0.7:      # light/white SVG  → dark bg
+        return (50, 55, 65)
+    elif avg_lum < 0.3:    # dark SVG         → light bg
+        return (240, 242, 245)
+    else:                  # mid-tone         → neutral
+        return (230, 232, 235)
+
+
 def _is_light_or_transparent(img: PILImage.Image) -> bool:
     """Check if image is mostly white/light or transparent."""
     rgba = img.convert("RGBA")
@@ -376,25 +464,10 @@ def _is_light_or_transparent(img: PILImage.Image) -> bool:
     return light_count / total > 0.4
 
 
-def _draw_checkerboard(size: tuple[int, int], cell_size: int = 8) -> PILImage.Image:
-    """Create a checkerboard pattern image (like Photoshop transparency grid)."""
-    w, h = size
-    img = PILImage.new("RGB", (w, h))
-    draw = ImageDraw.Draw(img)
-    c1 = (204, 204, 204)  # light gray
-    c2 = (240, 240, 240)  # lighter gray
-    for y in range(0, h, cell_size):
-        for x in range(0, w, cell_size):
-            color = c1 if (x // cell_size + y // cell_size) % 2 == 0 else c2
-            draw.rectangle([x, y, x + cell_size - 1, y + cell_size - 1], fill=color)
-    return img
-
-
-def make_thumbnail(image_path: str) -> str | None:
+def make_thumbnail(image_path: str, bg_hint: tuple[int, int, int] | None = None) -> str | None:
     """
-    Create a thumbnail with strong background for visibility.
-    - Light/white/transparent images: checkerboard background
-    - All images: 2px dark border
+    Create a thumbnail with the right background for visibility.
+    bg_hint: from SVG color analysis — used instead of auto-detection.
     """
     try:
         img = PILImage.open(image_path)
@@ -409,22 +482,19 @@ def make_thumbnail(image_path: str) -> str | None:
         bg_w = img.width + pad * 2
         bg_h = img.height + pad * 2
 
-        # Use checkerboard for light/transparent images, solid gray otherwise
-        if _is_light_or_transparent(img):
-            background = _draw_checkerboard((bg_w, bg_h)).convert("RGBA")
+        if bg_hint:
+            background = PILImage.new("RGBA", (bg_w, bg_h), bg_hint + (255,))
+        elif _is_light_or_transparent(img):
+            background = PILImage.new("RGBA", (bg_w, bg_h), (50, 55, 65, 255))
         else:
-            background = PILImage.new("RGBA", (bg_w, bg_h), (220, 220, 220, 255))
+            background = PILImage.new("RGBA", (bg_w, bg_h), (230, 232, 235, 255))
 
-        # Paste image centered
         background.paste(img, (pad, pad), mask=img)
         final = background.convert("RGB")
 
-        # Draw a 2px dark border around the entire thumbnail
+        border_color = (200, 200, 200) if bg_hint and _luminance(*bg_hint) < 0.4 else (140, 140, 140)
         draw = ImageDraw.Draw(final)
-        draw.rectangle(
-            [0, 0, bg_w - 1, bg_h - 1],
-            outline=(160, 160, 160), width=2
-        )
+        draw.rectangle([0, 0, bg_w - 1, bg_h - 1], outline=border_color, width=2)
 
         thumb_path = image_path + "_thumb.png"
         final.save(thumb_path, "PNG")
@@ -493,7 +563,12 @@ def save_to_excel(pages_data: list[dict], output_path: str, on_progress=None):
             cell_b = ws.cell(row=row, column=2)
 
             if local_path and os.path.isfile(local_path):
-                thumb = make_thumbnail(local_path)
+                # SVG color-aware background
+                bg_hint = None
+                svg_code = item.get("svg_content")
+                if svg_code:
+                    bg_hint = _svg_contrast_bg(svg_code)
+                thumb = make_thumbnail(local_path, bg_hint=bg_hint)
                 if thumb:
                     try:
                         xl_img = XlImage(thumb)
@@ -908,7 +983,9 @@ class ImageScraperApp:
                         local = save_inline_svg(img["svg_content"], dl_dir, inline_svg_counter)
                     else:
                         self._log(f"    ⬇ [{i+1}] {img['src'][:65]}…")
-                        local = download_image(img["src"], dl_dir)
+                        local, svg_source = download_image(img["src"], dl_dir)
+                        if svg_source:
+                            img["svg_content"] = svg_source
                     img["local_path"] = local
                     self.progress["value"] = i + 1
 
