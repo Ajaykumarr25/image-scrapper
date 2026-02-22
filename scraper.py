@@ -153,6 +153,51 @@ def discover_links(driver: webdriver.Chrome, page_url: str, base_domain: str) ->
     return links
 
 
+def _fetch_sitemap_urls(base_url: str, on_log=None) -> list[str]:
+    """Try to fetch and parse sitemap.xml, return list of page URLs."""
+    parsed = urlparse(base_url)
+    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+
+    try:
+        resp = requests.get(sitemap_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        if on_log:
+            on_log(f"  ✓ Found sitemap: {sitemap_url}")
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Check for sitemap index (contains other sitemaps)
+        sitemap_tags = soup.find_all("sitemap")
+        if sitemap_tags:
+            urls = []
+            for sm in sitemap_tags:
+                loc = sm.find("loc")
+                if loc and loc.text.strip():
+                    try:
+                        sub_resp = requests.get(loc.text.strip(), headers=HEADERS, timeout=15)
+                        sub_resp.raise_for_status()
+                        sub_soup = BeautifulSoup(sub_resp.text, "html.parser")
+                        for u in sub_soup.find_all("url"):
+                            l = u.find("loc")
+                            if l and l.text.strip():
+                                urls.append(l.text.strip())
+                    except Exception:
+                        continue
+            return urls
+
+        # Regular sitemap
+        url_tags = soup.find_all("url")
+        urls = []
+        for u in url_tags:
+            loc = u.find("loc")
+            if loc and loc.text.strip():
+                urls.append(loc.text.strip())
+        return urls
+
+    except Exception:
+        return []
+
+
 def crawl_site(
     driver: webdriver.Chrome,
     start_url: str,
@@ -161,13 +206,50 @@ def crawl_site(
     on_log=None,
 ) -> list[str]:
     """
-    BFS crawl from start_url, collecting up to max_pages internal URLs.
-    Returns a list of URLs in discovery order.
+    Discover pages via sitemap.xml first. Falls back to BFS crawl
+    if no sitemap is available.
+    Returns a list of URLs (up to max_pages).
     """
-    start_norm = normalize_url(start_url)
-    parsed = urlparse(start_norm)
+    parsed = urlparse(start_url)
     base_domain = parsed.netloc.lower().replace("www.", "")
 
+    if on_status:
+        on_status("🗺 Checking sitemap.xml…")
+    if on_log:
+        on_log("→ Looking for sitemap.xml…")
+
+    sitemap_urls = _fetch_sitemap_urls(start_url, on_log=on_log)
+
+    if sitemap_urls:
+        # Filter to same domain & deduplicate
+        seen = set()
+        ordered = []
+        for url in sitemap_urls:
+            p = urlparse(url)
+            if p.netloc.lower().replace("www.", "") != base_domain:
+                continue
+            ext = os.path.splitext(p.path)[1].lower()
+            if ext in SKIP_EXTENSIONS:
+                continue
+            norm = normalize_url(url)
+            if norm not in seen:
+                seen.add(norm)
+                ordered.append(norm)
+            if len(ordered) >= max_pages:
+                break
+
+        if ordered:
+            if on_log:
+                on_log(f"  ✓ Sitemap has {len(ordered)} page(s) (capped at {max_pages})")
+                for i, u in enumerate(ordered):
+                    on_log(f"  🔗 [{i+1}] {u}")
+            return ordered
+
+    # Fallback: BFS crawl
+    if on_log:
+        on_log("  ⚠ No sitemap found, falling back to link crawl…")
+
+    start_norm = normalize_url(start_url)
     visited = set()
     queue = deque([start_norm])
     ordered = []
