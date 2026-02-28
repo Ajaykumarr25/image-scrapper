@@ -1,0 +1,12 @@
+Total images found: 11
+1. https://www.tzieldhcp.com/assets/images/default-logo.svg | alt=TZIELD® (teplizumab-mzwv) Injection 2mg/2mL logo
+2. https://www.tzieldhcp.com/images/wp-content/uploads/2025/03/WHEN-Campaign-TICKER.png | alt=WHEN
+3. https://www.tzieldhcp.com/images/wp-content/uploads/2025/04/Clinical-Study-Data.svg | alt=A bar graph
+4. https://www.tzieldhcp.com/images/wp-content/uploads/2025/04/Shield-Blue.svg | alt=A shield with a checkmark on it
+5. https://www.tzieldhcp.com/images/wp-content/uploads/2025/03/girl-desktop.jpg | alt=A young girl riding her bike and smiling
+6. https://www.tzieldhcp.com/images/wp-content/uploads/2025/03/girl-mobile.jpg | alt=A young girl riding her bike and smiling
+7. https://www.tzieldhcp.com/images/wp-content/uploads/2025/03/compass.svg | alt=A location arrow
+8. https://www.tzieldhcp.com/images/wp-content/uploads/2025/01/Single-Dose-Vial.png | alt=An IV fluid bag
+9. https://www.tzieldhcp.com/images/wp-content/uploads/2024/12/Brand-Logo@3x.png | alt=TZIELD® (teplizumab-mzwv) Injection 2mg/2mL logo
+10. https://www.tzieldhcp.com/images/wp-content/uploads/2024/12/Sanofi-Logo.png | alt=Sanofi logo
+11. https://lciapi.ninthdecimal.com/v1/lci/imp/adv-inmarket/c-29780?typ=Multi&chn=inmarket&brand=convers | alt=None

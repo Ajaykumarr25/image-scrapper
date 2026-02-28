@@ -98,7 +98,7 @@ def create_driver() -> webdriver.Chrome:
 
 
 def load_page(driver: webdriver.Chrome, url: str):
-    """Navigate to URL and wait for content."""
+    """Navigate to URL, wait for content, and scroll to trigger lazy images."""
     driver.get(url)
     try:
         WebDriverWait(driver, 10).until(
@@ -107,6 +107,24 @@ def load_page(driver: webdriver.Chrome, url: str):
     except Exception:
         pass
     time.sleep(2)
+
+    # Scroll down the page incrementally to trigger lazy-loaded images
+    try:
+        total_height = driver.execute_script("return document.body.scrollHeight")
+        viewport_height = driver.execute_script("return window.innerHeight")
+        scroll_step = viewport_height // 2  # half-viewport steps
+        current = 0
+        while current < total_height:
+            current += scroll_step
+            driver.execute_script(f"window.scrollTo(0, {current});")
+            time.sleep(0.5)
+            # Re-check height in case content loaded dynamically
+            total_height = driver.execute_script("return document.body.scrollHeight")
+        # Scroll back to top
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+    except Exception:
+        pass
 
 
 # ── Site Crawler ─────────────────────────────────────────────────────────────
@@ -281,56 +299,132 @@ def crawl_site(
 
 # ── Image Extraction ─────────────────────────────────────────────────────────
 
-def extract_images(driver: webdriver.Chrome, url: str) -> list[dict]:
-    """Extract only visible, meaningful images from the currently loaded page."""
+def _is_tracking_pixel(src: str) -> bool:
+    """Check if a URL is a tracking pixel or analytics beacon."""
+    tracking_domains = [
+        "pixel.", "track", "beacon", "analytics",
+        "doubleclick", "facebook.com/tr", "google-analytics",
+        "cookielaw.org", "cdn.cookielaw.org",
+    ]
+    src_lower = src.lower()
+    for domain in tracking_domains:
+        if domain in src_lower:
+            return True
+    # Skip common pixel patterns
+    if re.search(r'[/&?]1x1|\.gif\?|pixel\.gif|spacer\.gif', src_lower):
+        return True
+    return False
+
+
+def _normalize_image_url(url: str) -> str:
+    """Normalize an image URL for deduplication — strip query params, fragment, trailing slash."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme, parsed.netloc.lower(), path, "", "", ""))
+
+
+def _url_filename(url: str) -> str:
+    """Extract the filename portion of a URL for secondary dedup."""
+    parsed = urlparse(url)
+    basename = os.path.basename(parsed.path)
+    return basename.lower() if basename else ""
+
+
+def extract_images(driver: webdriver.Chrome, url: str, include_hidden: bool = True) -> list[dict]:
+    """Extract only visible, meaningful images from the currently loaded page.
+    If include_hidden is True, also capture hidden ones in carousels/tabs."""
     images = []
-    seen = set()
+    seen_urls = set()       # Normalized URL dedup
+    seen_filenames = set()  # Filename dedup (catches same image from different CDN paths)
 
-    # Use Selenium to find visible <img> elements
-    img_elements = driver.find_elements(By.TAG_NAME, "img")
-    for el in img_elements:
-        try:
-            # Skip hidden / zero-size images
-            if not el.is_displayed():
+    if include_hidden:
+        # Use BeautifulSoup on the full page source to capture ALL <img> tags,
+        # including those hidden in carousels, sliders, tabs, etc.
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        for tag in soup.find_all("img"):
+            src = (tag.get("src") or "").strip()
+            if not src or src.startswith("data:"):
+                src = (tag.get("data-src") or "").strip()
+            if not src:
+                src = (tag.get("data-lazy-src") or "").strip()
+            if not src:
+                srcset = (tag.get("srcset") or "").strip()
+                if srcset:
+                    src = srcset.split(",")[0].strip().split(" ")[0]
+            if not src or src.startswith("data:"):
                 continue
-            w = el.size.get("width", 0)
-            h = el.size.get("height", 0)
-            # Skip tracking pixels and tiny decorative images
-            if w < 5 or h < 5:
+
+            abs_url = urljoin(url, src)
+
+            norm = _normalize_image_url(abs_url)
+            fname = _url_filename(abs_url)
+            if norm in seen_urls:
                 continue
-        except Exception:
-            continue
+            if fname and fname in seen_filenames:
+                continue
+            seen_urls.add(norm)
+            if fname:
+                seen_filenames.add(fname)
 
-        src = (
-            el.get_attribute("src") or ""
-        ).strip()
-        if not src:
-            src = (el.get_attribute("data-src") or "").strip()
-        if not src:
-            src = (el.get_attribute("data-lazy-src") or "").strip()
-        if not src:
-            srcset = (el.get_attribute("srcset") or "").strip()
-            if srcset:
-                src = srcset.split(",")[0].strip().split(" ")[0]
-        if not src or src.startswith("data:"):
-            continue
+            raw_alt = tag.get("alt")
+            alt = raw_alt.strip() if raw_alt is not None else None
 
-        abs_url = urljoin(url, src)
-        if abs_url in seen:
-            continue
-        seen.add(abs_url)
+            images.append({"src": abs_url, "alt": alt})
+    else:
+        # Use Selenium to find visible <img> elements
+        img_elements = driver.find_elements(By.TAG_NAME, "img")
+        for el in img_elements:
+            try:
+                # Skip hidden / zero-size images
+                if not el.is_displayed():
+                    continue
+                w = el.size.get("width", 0)
+                h = el.size.get("height", 0)
+                # Skip tracking pixels and tiny decorative images
+                if w < 5 or h < 5:
+                    continue
+            except Exception:
+                continue
 
-        raw_alt = el.get_attribute("alt")
-        alt = raw_alt.strip() if raw_alt is not None else None
+            src = (
+                el.get_attribute("src") or ""
+            ).strip()
+            if not src:
+                src = (el.get_attribute("data-src") or "").strip()
+            if not src:
+                src = (el.get_attribute("data-lazy-src") or "").strip()
+            if not src:
+                srcset = (el.get_attribute("srcset") or "").strip()
+                if srcset:
+                    src = srcset.split(",")[0].strip().split(" ")[0]
+            if not src or src.startswith("data:"):
+                continue
 
-        images.append({"src": abs_url, "alt": alt})
+            abs_url = urljoin(url, src)
+
+            norm = _normalize_image_url(abs_url)
+            fname = _url_filename(abs_url)
+            if norm in seen_urls:
+                continue
+            if fname and fname in seen_filenames:
+                continue
+            seen_urls.add(norm)
+            if fname:
+                seen_filenames.add(fname)
+
+            raw_alt = el.get_attribute("alt")
+            alt = raw_alt.strip() if raw_alt is not None else None
+
+            images.append({"src": abs_url, "alt": alt})
 
     # Inline SVGs — only visible ones with meaningful content
     svg_elements = driver.find_elements(By.TAG_NAME, "svg")
     for i, el in enumerate(svg_elements):
         try:
-            if not el.is_displayed():
-                continue
+            if not include_hidden:
+                if not el.is_displayed():
+                    continue
             w = el.size.get("width", 0)
             h = el.size.get("height", 0)
             if w < 10 or h < 10:
@@ -347,9 +441,9 @@ def extract_images(driver: webdriver.Chrome, url: str) -> list[dict]:
             continue
 
         key = f"__inline_svg_{i}__"
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
 
         images.append({
             "src": f"[inline SVG #{i+1}]",
@@ -897,6 +991,26 @@ class ImageScraperApp:
         )
         spinner.pack(side="left", padx=(8, 0))
 
+        # Include Hidden Images toggle
+        hidden_frame = tk.Frame(card, bg=self.CARD_BG)
+        hidden_frame.pack(padx=14, pady=(8, 0), fill="x")
+
+        self.include_hidden_var = tk.BooleanVar(value=False)
+        self.hidden_toggle = tk.Checkbutton(
+            hidden_frame, text="Include Hidden Images",
+            variable=self.include_hidden_var,
+            font=("Segoe UI", 10), bg=self.CARD_BG, fg=self.SUBTEXT,
+            activebackground=self.CARD_BG, activeforeground=self.TEXT,
+            selectcolor="#0F172A", highlightthickness=0,
+            cursor="hand2",
+        )
+        self.hidden_toggle.pack(side="left")
+
+        tk.Label(
+            hidden_frame, text="(scrape images hidden in carousels, sliders, tabs, etc.)",
+            font=("Segoe UI", 9), bg=self.CARD_BG, fg="#64748B",
+        ).pack(side="left", padx=(4, 0))
+
         # Buttons
         btn_frame = tk.Frame(card, bg=self.CARD_BG)
         btn_frame.pack(padx=14, pady=12, fill="x")
@@ -1006,6 +1120,7 @@ class ImageScraperApp:
     def _worker(self, start_url: str):
         try:
             max_pages = self.max_pages_var.get()
+            include_hidden = self.include_hidden_var.get()
             save_xlsx = self.save_path_var.get()
             dl_dir = os.path.join(os.path.dirname(save_xlsx), "downloaded_images")
             os.makedirs(dl_dir, exist_ok=True)
@@ -1035,7 +1150,7 @@ class ImageScraperApp:
 
                 try:
                     load_page(driver, url)
-                    images = extract_images(driver, url)
+                    images = extract_images(driver, url, include_hidden=include_hidden)
                 except Exception as e:
                     self._log(f"  ✗ Failed: {e}")
                     pages_data.append({"url": url, "images": []})
