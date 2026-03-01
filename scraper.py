@@ -130,13 +130,13 @@ def load_page(driver: webdriver.Chrome, url: str):
 # ── Site Crawler ─────────────────────────────────────────────────────────────
 
 def normalize_url(url: str) -> str:
-    """Normalize a URL for deduplication."""
+    """Normalize a URL for deduplication (strips query params & fragment)."""
     parsed = urlparse(url)
-    # Remove fragment, normalize path
+    # Remove fragment AND query string, normalize path
     path = parsed.path.rstrip("/") or "/"
     return urlunparse((
         parsed.scheme, parsed.netloc.lower(), path,
-        parsed.params, parsed.query, ""
+        "", "", ""
     ))
 
 
@@ -182,7 +182,8 @@ def _fetch_sitemap_urls(base_url: str, on_log=None) -> list[str]:
         if on_log:
             on_log(f"  ✓ Found sitemap: {sitemap_url}")
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # Use lxml-xml parser to handle XML namespaces (e.g. ns1:url → url)
+        soup = BeautifulSoup(resp.text, "lxml-xml")
 
         # Check for sitemap index (contains other sitemaps)
         sitemap_tags = soup.find_all("sitemap")
@@ -194,7 +195,7 @@ def _fetch_sitemap_urls(base_url: str, on_log=None) -> list[str]:
                     try:
                         sub_resp = requests.get(loc.text.strip(), headers=HEADERS, timeout=15)
                         sub_resp.raise_for_status()
-                        sub_soup = BeautifulSoup(sub_resp.text, "html.parser")
+                        sub_soup = BeautifulSoup(sub_resp.text, "lxml-xml")
                         for u in sub_soup.find_all("url"):
                             l = u.find("loc")
                             if l and l.text.strip():
@@ -1144,9 +1145,19 @@ class ImageScraperApp:
             inline_svg_counter = 0
             seen_svg_hashes = set()  # Deduplicate SVGs across all pages
 
-            for pi, url in enumerate(page_urls):
-                self._status(f"🔍 Scraping page {pi+1}/{len(page_urls)}…")
-                self._log(f"\n📄 Page {pi+1}/{len(page_urls)}: {url}")
+            # Build a visited set and a dynamic scrape queue
+            parsed_start = urlparse(start_url)
+            base_domain = parsed_start.netloc.lower().replace("www.", "")
+            visited_urls = set(page_urls)       # Pages already known from crawl
+            scrape_queue = deque(page_urls)      # Mutable queue for scraping
+            page_index = 0
+
+            while scrape_queue and page_index < max_pages:
+                url = scrape_queue.popleft()
+                page_index += 1
+
+                self._status(f"🔍 Scraping page {page_index}/{max_pages}…")
+                self._log(f"\n📄 Page {page_index}: {url}")
 
                 try:
                     load_page(driver, url)
@@ -1155,6 +1166,20 @@ class ImageScraperApp:
                     self._log(f"  ✗ Failed: {e}")
                     pages_data.append({"url": url, "images": []})
                     continue
+
+                # Discover new internal links on this page & add unseen ones
+                try:
+                    new_links = discover_links(driver, url, base_domain)
+                    added = 0
+                    for link in new_links:
+                        if link not in visited_urls:
+                            visited_urls.add(link)
+                            scrape_queue.append(link)
+                            added += 1
+                    if added:
+                        self._log(f"  🔗 Discovered {added} new link(s) to scrape")
+                except Exception:
+                    pass  # link discovery is best-effort
 
                 # Deduplicate SVGs across pages by content hash
                 filtered = []
